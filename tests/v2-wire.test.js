@@ -20,9 +20,15 @@ const fakeContext = () => {
     location: { directory: process.cwd(), project: { id: "prj", directory: process.cwd(), canonical: process.cwd() } },
     options: {},
     event: {
-      subscribe: () => ({
+      subscribe: ({ signal } = {}) => ({
         [Symbol.asyncIterator]() {
-          return { next: () => new Promise((resolve) => subscribers.push(resolve)) }
+          return {
+            next: () =>
+              new Promise((resolve) => {
+                subscribers.push(resolve)
+                signal?.addEventListener("abort", () => resolve({ done: true }), { once: true })
+              }),
+          }
         },
       }),
     },
@@ -37,7 +43,11 @@ const fakeContext = () => {
     },
   }
   const find = (bucket, name) => bucket.find((entry) => entry.name === name)?.callback
-  return { ctx, hooks, tools, find }
+  const emit = async (type, data) => {
+    while (subscribers.length === 0) await new Promise((resolve) => setTimeout(resolve, 5))
+    subscribers.shift()({ value: { type, data, created: Date.now() }, done: false })
+  }
+  return { ctx, hooks, tools, find, emit }
 }
 
 describe("OpenCode 2 entrypoints", () => {
@@ -102,6 +112,45 @@ describe("OpenCode 2 entrypoints", () => {
     expect(status.configured).toBe(true)
 
     expect(typeof cleanup).toBe("function")
-    cleanup()
+    await cleanup()
+  })
+})
+
+describe("OpenCode 2 cleanup", () => {
+  test("cleanup waits for an in-flight Honcho write", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "honcho-v2-"))
+    const configPath = path.join(dir, "config.json")
+    await writeFile(configPath, JSON.stringify({ apiKey: "test-key", peerName: "wire" }))
+
+    // Every Honcho request waits on the gate, then fails; the plugin logs and moves on.
+    let release
+    const gate = new Promise((resolve) => (release = resolve))
+    let requests = 0
+    const realFetch = globalThis.fetch
+    const realError = console.error
+    globalThis.fetch = async () => {
+      requests += 1
+      await gate
+      throw new Error("stubbed")
+    }
+    console.error = () => {}
+    try {
+      const { ctx, emit } = fakeContext()
+      ctx.options = { configPath }
+      const cleanup = await (await import("../dist/server.js")).default.setup(ctx)
+      await emit("session.step.ended", { sessionID: "ses_a", assistantMessageID: "msg_a" })
+      while (requests === 0) await new Promise((resolve) => setTimeout(resolve, 5))
+
+      let settled = false
+      const closing = cleanup().then(() => (settled = true))
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(settled).toBe(false)
+      release()
+      await closing
+    } finally {
+      release()
+      globalThis.fetch = realFetch
+      console.error = realError
+    }
   })
 })

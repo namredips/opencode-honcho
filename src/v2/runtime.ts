@@ -11,6 +11,8 @@ type V2Event = ReturnType<PluginContext["event"]["subscribe"]> extends AsyncIter
 
 export const PLUGIN_ID = "@honcho-ai/opencode-honcho"
 
+const SETTLE_TIMEOUT_MS = 15_000
+
 const modelId = (model: ModelRef | undefined) => {
   if (!model || typeof model.id !== "string" || !model.id.trim()) return null
   const provider = typeof model.providerID === "string" ? model.providerID.trim() : ""
@@ -171,17 +173,22 @@ export const setup = async (ctx: PluginContext) => {
   }
 
   const controller = new AbortController()
+  const inflight = new Set<Promise<void>>()
   void (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         if (!isCurrentGeneration(location, generation)) break
+        const work = handleEvent(event)
+        inflight.add(work)
         try {
-          await handleEvent(event)
+          await work
         } catch (error) {
           await core.log("error", "Honcho event handling failed.", {
             event: event.type,
             message: error instanceof Error ? error.message : String(error),
           })
+        } finally {
+          inflight.delete(work)
         }
       }
     } catch (error) {
@@ -199,8 +206,14 @@ export const setup = async (ctx: PluginContext) => {
     directory: ctx.location.directory,
   })
 
-  // Abort, never await the stream: waiting on it here stalls plugin reloads.
-  return () => {
+  // `opencode run --standalone` exits once this resolves, so wait for writes still in flight.
+  // Never await the stream itself: that stalls plugin reloads.
+  return async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, SETTLE_TIMEOUT_MS)
+    })
+    await Promise.race([Promise.allSettled([...inflight]), timeout]).finally(() => clearTimeout(timer))
     controller.abort()
   }
 }
